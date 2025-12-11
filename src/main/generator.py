@@ -1,108 +1,91 @@
-import tensorflow as tf
-from tensorflow.keras import layers
-from tensorflow.keras.applications.resnet_v2 import ResNet50V2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights
 
 from main import model_util
 from main.config import Config
 from main.smpl import Smpl
 
 
-class Regressor(tf.keras.Model):
-
+class Regressor(nn.Module):
     def __init__(self):
-        super(Regressor, self).__init__(name='regressor')
+        super(Regressor, self).__init__()
         self.config = Config()
 
-        self.mean_theta = tf.Variable(model_util.load_mean_theta(), name='mean_theta', trainable=True)
+        self.mean_theta = nn.Parameter(torch.from_numpy(model_util.load_mean_theta()))
 
-        self.fc_one = layers.Dense(1024, name='fc_0')
-        self.dropout_one = layers.Dropout(0.5)
-        self.fc_two = layers.Dense(1024, name='fc_1')
-        self.dropout_two = layers.Dropout(0.5)
-        variance_scaling = tf.initializers.VarianceScaling(.01, mode='fan_avg', distribution='uniform')
-        self.fc_out = layers.Dense(85, kernel_initializer=variance_scaling, name='fc_out')
+        self.fc_one = nn.Linear(2048 + 85, 1024)
+        self.dropout_one = nn.Dropout(0.5)
+        self.fc_two = nn.Linear(1024, 1024)
+        self.dropout_two = nn.Dropout(0.5)
+        self.fc_out = nn.Linear(1024, 85)
+        
+        # Initialize fc_out weights
+        nn.init.uniform_(self.fc_out.weight, -0.01, 0.01)
+        nn.init.zeros_(self.fc_out.bias)
 
-    def call(self, inputs, **kwargs):
-        batch_size = inputs.shape[0] or self.config.BATCH_SIZE
-        shape = (batch_size, 2048)
-        assert inputs.shape[1:] == shape[1:], 'shape mismatch: should be {} but is {}'.format(shape, inputs.shape)
-
-        batch_theta = tf.tile(self.mean_theta, [batch_size, 1])
-        thetas = tf.TensorArray(tf.float32, self.config.ITERATIONS)
+    def forward(self, inputs):
+        batch_size = inputs.shape[0]
+        batch_theta = self.mean_theta.expand(batch_size, -1)
+        
+        thetas = []
         for i in range(self.config.ITERATIONS):
-            # [batch x 2133] <- [batch x 2048] + [batch x 85]
-            total_inputs = tf.concat([inputs, batch_theta], axis=1)
-            batch_theta = batch_theta + self._fc_blocks(total_inputs, **kwargs)
-            thetas = thetas.write(i, batch_theta)
+            total_inputs = torch.cat([inputs, batch_theta], dim=1)
+            batch_theta = batch_theta + self._fc_blocks(total_inputs)
+            thetas.append(batch_theta)
+            
+        return torch.stack(thetas, dim=0)
 
-        return thetas.stack()
-
-    def _fc_blocks(self, inputs, **kwargs):
-        x = self.fc_one(inputs, **kwargs)
-        x = tf.nn.relu(x)
-        x = self.dropout_one(x, **kwargs)
-        x = self.fc_two(x, **kwargs)
-        x = tf.nn.relu(x)
-        x = self.dropout_two(x, **kwargs)
-        x = self.fc_out(x, **kwargs)
+    def _fc_blocks(self, inputs):
+        x = self.fc_one(inputs)
+        x = F.relu(x)
+        x = self.dropout_one(x)
+        x = self.fc_two(x)
+        x = F.relu(x)
+        x = self.dropout_two(x)
+        x = self.fc_out(x)
         return x
 
 
-class Generator(tf.keras.Model):
-
+class Generator(nn.Module):
     def __init__(self):
-        super(Generator, self).__init__(name='generator')
+        super(Generator, self).__init__()
         self.config = Config()
 
         self.enc_shape = self.config.ENCODER_INPUT_SHAPE
-        self.resnet50V2 = ResNet50V2(include_top=False, weights='imagenet', input_shape=self.enc_shape, pooling='avg')
-        self._set_resnet_arg_scope()
+        
+        # Load pretrained ResNet50 and remove the final fully connected layer
+        resnet50_pretrained = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        self.resnet50 = nn.Sequential(*list(resnet50_pretrained.children())[:-1])
+        self.flatten = nn.Flatten()
+        
+        # Note: The _set_resnet_arg_scope logic for custom initialization and regularization
+        # is handled differently in PyTorch. Regularization is applied in the optimizer.
+        # Custom initializations would typically be done in a separate function
+        # that iterates through model.modules(). For direct translation, we omit this.
 
         self.regressor = Regressor()
         self.smpl = Smpl()
 
-    def _set_resnet_arg_scope(self):
-        """This method acts similar to TF 1.x contrib's slim `resnet_arg_scope()`.
-            It overrides
-        """
-        vs_initializer = tf.keras.initializers.VarianceScaling(2.0)
-        l2_regularizer = tf.keras.regularizers.l2(self.config.GENERATOR_WEIGHT_DECAY)
-        for layer in self.resnet50V2.layers:
-            if isinstance(layer, layers.Conv2D):
-                # original implementations slim `resnet_arg_scope` additionally sets
-                # `normalizer_fn` and `normalizer_params` which in TF 2.0 need to be implemented
-                # as own layers. This is not possible using keras ResNet50V2 application.
-                # Nevertheless this is not needed as training seems to be likely stable.
-                # See https://www.tensorflow.org/guide/migrate#a_note_on_slim_contriblayers for more
-                # migration insights
-                setattr(layer, 'padding', 'same')
-                setattr(layer, 'kernel_initializer', vs_initializer)
-                setattr(layer, 'kernel_regularizer', l2_regularizer)
-            if isinstance(layer, layers.BatchNormalization):
-                setattr(layer, 'momentum', 0.997)
-                setattr(layer, 'epsilon', 1e-5)
-            if isinstance(layer, layers.MaxPooling2D):
-                setattr(layer, 'padding', 'same')
-
-    def call(self, inputs, **kwargs):
-        check = inputs.shape[1:] == self.enc_shape
-        assert check, 'shape mismatch: should be {} but is {}'.format(self.enc_shape, inputs.shape)
-
-        features = self.resnet50V2(inputs, **kwargs)
-        thetas = self.regressor(features, **kwargs)
-
+    def forward(self, inputs):
+        features = self.resnet50(inputs)
+        features = self.flatten(features)
+        thetas = self.regressor(features)
+        
         outputs = []
         for i in range(self.config.ITERATIONS):
-            theta = thetas[i, :]
-            outputs.append(self._compute_output(theta, **kwargs))
-
+            theta = thetas[i, :, :] # Correct indexing for stacked tensor
+            output_tuple = self._compute_output(theta)
+            outputs.append(output_tuple)
+            
         return outputs
 
-    def _compute_output(self, theta, **kwargs):
+    def _compute_output(self, theta):
         cams = theta[:, :self.config.NUM_CAMERA_PARAMS]
         pose_and_shape = theta[:, self.config.NUM_CAMERA_PARAMS:]
-        vertices, joints_3d, rotations = self.smpl(pose_and_shape, **kwargs)
+        vertices, joints_3d, rotations = self.smpl(pose_and_shape)
         joints_2d = model_util.batch_orthographic_projection(joints_3d, cams)
         shapes = theta[:, -self.config.NUM_SHAPE_PARAMS:]
-
-        return tf.tuple([vertices, joints_2d, joints_3d, rotations, shapes, cams])
+        
+        return (vertices, joints_2d, joints_3d, rotations, shapes, cams)
