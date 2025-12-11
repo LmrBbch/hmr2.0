@@ -1,246 +1,159 @@
 import h5py
 import numpy as np
-import tensorflow as tf
-
+import torch
+import torch.nn.functional as F
 from main.config import Config
 
-
 def batch_compute_similarity_transform(real_kp3d, pred_kp3d):
-    """Computes a similarity transform (sR, trans) that takes
-        a set of 3D points S1 (3 x N) closest to a set of 3D points S2,
-        where R is an 3x3 rotation matrix, trans 3x1 translation, u scale.
-        i.e. solves the orthogonal Procrustes problem.
-    Args:
-        real_kp3d: [batch x K x 3]
-        pred_kp3d: [batch x K x 3]
-    Returns:
-        aligned_kp3d: [batch x K x 3]
-    """
-    # transpose to [batch x 3 x K]
-    real_kp3d = tf.transpose(real_kp3d, perm=[0, 2, 1])
-    pred_kp3d = tf.transpose(pred_kp3d, perm=[0, 2, 1])
-
-    # 1. Remove mean.
-    mean_real = tf.reduce_mean(real_kp3d, axis=2, keepdims=True)
-    mean_pred = tf.reduce_mean(pred_kp3d, axis=2, keepdims=True)
-
+    real_kp3d = real_kp3d.transpose(1, 2)
+    pred_kp3d = pred_kp3d.transpose(1, 2)
+    
+    mean_real = real_kp3d.mean(dim=2, keepdim=True)
+    mean_pred = pred_kp3d.mean(dim=2, keepdim=True)
+    
     centered_real = real_kp3d - mean_real
     centered_pred = pred_kp3d - mean_pred
-
-    # 2. Compute variance of centered_real used for scale.
-    variance = tf.reduce_sum(centered_pred ** 2, axis=[-2, -1], keepdims=True)
-
-    # 3. The outer product of centered_real and centered_pred.
-    K = tf.matmul(centered_pred, centered_real, transpose_b=True)
-
-    # 4. Solution that Maximizes trace(R'K) is R=s*V', where s, V are
-    # singular vectors of K.
-    with tf.device('/CPU:0'):
-        # SVD is terrifyingly slow on GPUs, use cpus for this. Makes it a lot faster.
-        s, u, v = tf.linalg.svd(K, full_matrices=True)
-
-        # Construct identity that fixes the orientation of R to get det(R)=1.
-        det = tf.sign(tf.linalg.det(tf.matmul(u, v, transpose_b=True)))
-
-    det = tf.expand_dims(tf.expand_dims(det, -1), -1)
-    shape = tf.shape(u)
-    identity = tf.eye(shape[1], batch_shape=[shape[0]])
+    
+    variance = (centered_pred ** 2).sum(dim=(-2, -1), keepdim=True)
+    
+    K = torch.matmul(centered_pred, centered_real.transpose(1, 2))
+    
+    u, s, v = torch.svd(K.cpu()) # SVD on CPU for speed
+    u, s, v = u.to(K.device), s.to(K.device), v.to(K.device)
+    
+    det = torch.det(torch.matmul(u, v.transpose(1, 2))).sign()
+    det = det.unsqueeze(-1).unsqueeze(-1)
+    
+    identity = torch.eye(u.shape[1], device=u.device).unsqueeze(0).repeat(u.shape[0], 1, 1)
     identity = identity * det
-
-    # Construct R.
-    R = tf.matmul(v, tf.matmul(identity, u, transpose_b=True))
-
-    # 5. Recover scale.
-    trace = tf.linalg.trace(tf.matmul(R, K))
-    trace = tf.expand_dims(tf.expand_dims(trace, -1), -1)
+    
+    R = torch.matmul(v, torch.matmul(identity, u.transpose(1, 2)))
+    
+    trace = torch.einsum('bii->b', torch.matmul(R, K)).unsqueeze(-1).unsqueeze(-1)
     scale = trace / variance
-
-    # 6. Recover translation.
-    trans = mean_real - scale * tf.matmul(R, mean_pred)
-
-    # 7. Align
-    aligned_kp3d = scale * tf.matmul(R, pred_kp3d) + trans
-
-    return tf.transpose(aligned_kp3d, perm=[0, 2, 1])
-
+    
+    trans = mean_real - scale * torch.matmul(R, mean_pred)
+    
+    aligned_kp3d = scale * torch.matmul(R, pred_kp3d) + trans
+    
+    return aligned_kp3d.transpose(1, 2)
 
 def batch_align_by_pelvis(kp3d):
-    """Assumes kp3d is [batch x 14 x 3] in LSP order. Then hips are id [2, 3].
-       Takes mid point of these points, then subtracts it.
-    Args:
-        kp3d: [batch x K x 3]
-    Returns:
-        aligned_kp3d: [batch x K x 3]
-    """
     left_id, right_id = 3, 2
-    pelvis = (kp3d[:, left_id, :] + kp3d[:, right_id, :]) / 2.
-    return kp3d - tf.expand_dims(pelvis, axis=1)
-
+    pelvis = (kp3d[:, left_id, :] + kp3d[:, right_id, :]) / 2.0
+    return kp3d - pelvis.unsqueeze(1)
 
 def batch_orthographic_projection(kp3d, camera):
-    """computes reprojected 3d to 2d keypoints
-    Args:
-        kp3d:   [batch x K x 3]
-        camera: [batch x 3]
-    Returns:
-        kp2d: [batch x K x 2]
-    """
-    camera = tf.reshape(camera, (-1, 1, 3))
+    camera = camera.view(-1, 1, 3)
     kp_trans = kp3d[:, :, :2] + camera[:, :, 1:]
     shape = kp_trans.shape
-
-    kp_trans = tf.reshape(kp_trans, (shape[0], -1))
+    kp_trans = kp_trans.view(shape[0], -1)
     kp2d = camera[:, :, 0] * kp_trans
-
-    return tf.reshape(kp2d, shape)
-
+    return kp2d.view(shape)
 
 def batch_skew_symmetric(vector):
-    """computes skew symmetric matrix given vector
-    Args:
-        vector: [batch x (K + 1) x 3]
-    Returns:
-        skew_symm: [batch x (K + 1) x 3 x 3]
-    """
     config = Config()
-    batch_size = vector.shape[0] or config.BATCH_SIZE
+    batch_size = vector.shape[0]
     num_joints = config.NUM_JOINTS_GLOBAL
-
-    zeros = tf.zeros([batch_size, num_joints, 3])
-
-    # //@formatter:off
-    skew_sym = tf.stack(
-        [zeros[:, :, 0], -vector[:, :, 2], vector[:, :, 1],
-         vector[:, :, 2], zeros[:, :, 1], -vector[:, :, 0],
-         -vector[:, :, 1], vector[:, :, 0], zeros[:, :, 2]],
-        -1)
-    # //@formatter:on
-
-    return tf.reshape(skew_sym, [batch_size, num_joints, 3, 3])
-
+    
+    zeros = torch.zeros(batch_size, num_joints, 1, device=vector.device)
+    
+    skew_sym = torch.stack(
+        [zeros, -vector[:, :, 2:3], vector[:, :, 1:2],
+         vector[:, :, 2:3], zeros, -vector[:, :, 0:1],
+         -vector[:, :, 1:2], vector[:, :, 0:1], zeros],
+        dim=-1)
+    
+    return skew_sym.view(batch_size, num_joints, 3, 3)
 
 def batch_rodrigues(theta):
-    """computes rotation matrix for given angle (x, y, z)
-        see equation 2 of SPML (http://files.is.tue.mpg.de/black/papers/SMPL2015.pdf)
-        for more information about this implementation see
-        (https://en.wikipedia.org/wiki/Rotation_matrix#Rotation_matrix_from_axis_and_angle)
-    Args:
-        theta   : [batch x 72] where 72 is (K + 1) * 3 joint angles
-                                with K joints + global rotation
-    Returns:
-        rot_mat : [batch x (K + 1) x 9] rotation matrix for every joint K
-    """
     config = Config()
-    batch_size = theta.shape[0] or config.BATCH_SIZE
+    batch_size = theta.shape[0]
     num_joints = config.NUM_JOINTS_GLOBAL
-
-    theta = tf.reshape(theta, [batch_size, num_joints, 3])
-    batch_identity = tf.eye(3, 3, batch_shape=(batch_size, num_joints,))
-
-    batch_theta_norm = tf.expand_dims(tf.norm(theta + 1e-8, axis=2), -1)
-    batch_unit_norm_axis = tf.math.truediv(theta, batch_theta_norm)
-    batch_skew_symm = batch_skew_symmetric(batch_unit_norm_axis)
-
-    batch_cos = tf.expand_dims(tf.cos(batch_theta_norm), -1)
-    batch_sin = tf.expand_dims(tf.sin(batch_theta_norm), -1)
-
-    batch_unit_norm_axis = tf.expand_dims(batch_unit_norm_axis, -1)
-    batch_outer = tf.matmul(batch_unit_norm_axis, batch_unit_norm_axis, transpose_b=True)
-    rot_mat = batch_identity * batch_cos + (1 - batch_cos) * batch_outer + batch_sin * batch_skew_symm
-    rot_mat = tf.reshape(rot_mat, [batch_size, num_joints, -1])
+    
+    theta = theta.view(batch_size, num_joints, 3)
+    
+    angle = torch.norm(theta + 1e-8, dim=2, keepdim=True)
+    axis = theta / angle
+    
+    skew_symm = batch_skew_symmetric(axis)
+    
+    cos_angle = torch.cos(angle).unsqueeze(-1)
+    sin_angle = torch.sin(angle).unsqueeze(-1)
+    
+    axis = axis.unsqueeze(-1)
+    outer = torch.matmul(axis, axis.transpose(2, 3))
+    
+    identity = torch.eye(3, device=theta.device).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_joints, 1, 1)
+    
+    rot_mat = identity * cos_angle + (1 - cos_angle) * outer + sin_angle * skew_symm
+    rot_mat = rot_mat.view(batch_size, num_joints, 9)
     return rot_mat
 
-
 def batch_global_rigid_transformation(rot_mat, joints, ancestors, rotate_base=False):
-    """Computes absolute joint locations given pose.
-        see equation 3 & 4 of SPML (http://files.is.tue.mpg.de/black/papers/SMPL2015.pdf)
-    Args:
-        rot_mat     : [batch x (K + r) x 3 x 3] rotation matrix of K + r
-                      with 'r' = 1 (global root rotation)
-        joints      : [batch x (K + r) x 3] joint locations before posing
-        ancestors   : K + r holding the ancestor id for every joint by index
-        rotate_base : if True, rotates the global rotation by 90 deg in x axis,
-                      else this is the original SMPL coordinate.
-    Returns
-        new_joints  : [batch x (K + 1) x 3] location of absolute joints
-        rel_joints  : [batch x (K + 1) x 4 x 4] relative joint transformations for LBS.
-    """
     config = Config()
-    batch_size = rot_mat.shape[0] or config.BATCH_SIZE
+    batch_size = rot_mat.shape[0]
     num_joints = config.NUM_JOINTS_GLOBAL
-
+    
     if rotate_base:
-        # //@formatter:off
-        rot_x = tf.constant([[1, 0, 0],
-                             [0, -1, 0],
-                             [0, 0, -1]], dtype=tf.float32)
-        # //@formatter:on
-        rot_x = tf.reshape(tf.tile(rot_x, [batch_size, 1]), [batch_size, 3, 3])
-        root_rotation = tf.matmul(rot_mat[:, 0, :, :], rot_x)
+        rot_x = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=torch.float32, device=rot_mat.device)
+        rot_x = rot_x.unsqueeze(0).repeat(batch_size, 1, 1)
+        root_rotation = torch.matmul(rot_mat[:, 0, :, :], rot_x)
     else:
-        # global root rotation
         root_rotation = rot_mat[:, 0, :, :]
-
+        
     def create_global_rot_for(_rotation, _joint):
-        """creates the world transformation in homogeneous coordinates of joint
-            see equation 4
-        Args:
-            _rotation: [batch x 3 x 3] rotation matrix of j's angles
-            _joint: [batch x 3 x 1] single joint center of j
-        Returns:
-            _joint_world_trans: [batch x 4 x 4] world transformation in homogeneous
-                                coordinates of joint j
-        """
-        _rot_homo = tf.pad(_rotation, [[0, 0], [0, 1], [0, 0]])
-        _joint_homo = tf.concat([_joint, tf.ones([batch_size, 1, 1])], 1)
-        _joint_world_trans = tf.concat([_rot_homo, _joint_homo], 2)
+        _rot_homo = F.pad(_rotation, (0, 0, 0, 1, 0, 0))
+        _joint_homo = torch.cat([_joint, torch.ones(batch_size, 1, 1, device=_joint.device)], dim=1)
+        _joint_world_trans = torch.cat([_rot_homo, _joint_homo], dim=2)
         return _joint_world_trans
 
-    joints = tf.expand_dims(joints, -1)
+    joints = joints.unsqueeze(-1)
     root_trans = create_global_rot_for(root_rotation, joints[:, 0])
-
+    
     results = [root_trans]
-    # compute global transformation for ordered set of joint ancestors of
+    # In PyTorch, it's better to build the list first and then stack.
+    # The direct append and index approach from TF is inefficient.
+    # We will pre-calculate all transformations.
+    
+    # This loop is complex to translate directly due to dependencies.
+    # A more PyTorch-idiomatic way would involve a batched tree traversal,
+    # which is beyond a direct line-by-line translation.
+    # The following is a functional, but potentially slow, translation.
+    
+    # Pre-allocate tensor for results
+    results_tensor = torch.zeros(batch_size, num_joints, 4, 4, device=rot_mat.device)
+    results_tensor[:, 0] = root_trans
+    
     for i in range(1, ancestors.shape[0]):
-        joint = joints[:, i] - joints[:, ancestors[i]]
-        joint_glob_rot = create_global_rot_for(rot_mat[:, i], joint)
-        res_here = tf.matmul(results[ancestors[i]], joint_glob_rot)
-        results.append(res_here)
+        parent_idx = ancestors[i]
+        joint_rel = joints[:, i] - joints[:, parent_idx]
+        joint_glob_rot = create_global_rot_for(rot_mat[:, i], joint_rel)
+        parent_trans = results_tensor[:, parent_idx]
+        results_tensor[:, i] = torch.matmul(parent_trans, joint_glob_rot)
+        
+    new_joints = results_tensor[:, :, :3, 3]
 
-    results = tf.stack(results, 1)
-    new_joints = results[:, :, :3, 3]
-
-    # --- Compute relative A: Skinning is based on
-    # how much the bone moved (not the final location of the bone)
-    # but (final_bone - init_bone)
-    # ---
-    zeros = tf.zeros([batch_size, num_joints, 1, 1])
-    rest_pose = tf.concat([joints, zeros], 2)
-    init_bone = tf.matmul(results, rest_pose)
-    init_bone = tf.pad(init_bone, [[0, 0], [0, 0], [0, 0], [3, 0]])
-    rel_joints = results - init_bone
-
+    zeros = torch.zeros(batch_size, num_joints, 1, 1, device=joints.device)
+    rest_pose = torch.cat([joints, zeros], dim=2)
+    init_bone = torch.matmul(results_tensor, rest_pose)
+    init_bone = F.pad(init_bone, (3, 0, 0, 0, 0, 0, 0, 0)) # Pad last dimension
+    rel_joints = results_tensor - init_bone
+    
     return new_joints, rel_joints
 
-
 def load_mean_theta():
-    """loads mean theta values
-
-    Returns:
-        mean: [batch x 85]
-    """
     config = Config()
-    mean_values = h5py.File(config.SMPL_MEAN_THETA_PATH, mode='r')
+    with h5py.File(config.SMPL_MEAN_THETA_PATH, 'r') as f:
+        mean_pose = f['pose'][:]
+        mean_shape = f['shape'][:]
+    
     mean = np.zeros((1, config.NUM_SMPL_PARAMS))
-
-    mean_pose = mean_values.get('pose')[()]  # 72
-    mean_pose[:3] = 0.  # Ignore the global rotation.
-    mean_pose[0] = np.pi  # This initializes the global pose to be up-right when projected
-
-    mean_shape = mean_values.get('shape')[()]  # 10
-
-    # init scale is 0.9
+    
+    mean_pose[:3] = 0.
+    mean_pose[0] = np.pi
+    
     mean[0, 0] = 0.9
     mean[:, config.NUM_CAMERA_PARAMS:] = np.hstack((mean_pose, mean_shape))
-    mean = tf.cast(mean, dtype=tf.float32)
-    return mean
+    
+    return torch.tensor(mean, dtype=torch.float32)
